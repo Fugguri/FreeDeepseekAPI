@@ -138,7 +138,59 @@ data: {"p": "response/done"}
 - The first SSE event (metadata) contains the first characters of content; subsequent `response/content` events append more
 - On session reuse, the first 2 characters ("TO") arrive in the metadata content, the rest in content events
 
-### 2.4 Proof-of-Work (SHA3 Wasm)
+### 2.4 File Upload & Vision (Reverse-Engineered)
+
+Image understanding is a three-step pipeline against the internal file API.
+
+**Step 1 — upload the bytes**
+
+```
+POST /api/v0/file/upload_file
+Headers:
+  ...same auth headers as completion...
+  X-DS-PoW-Response: <base64 PoW bound to target_path="/api/v0/file/upload_file">
+  Content-Type: multipart/form-data   ← must NOT be application/json
+Body: multipart/form-data, single field "file" (a real extension is required,
+      e.g. image.png — DeepSeek rejects a bare name as "unsupported file type")
+
+Response:
+{"data":{"biz_data":{"id":"file-<uuid>","status":"PENDING","model_kind":"VISION","is_image":true}}}
+```
+
+**Step 2 — wait until parsing finishes**
+
+```
+GET /api/v0/file/fetch_files?file_ids=file-<uuid>
+
+Response status progression: PENDING → PARSING → SUCCESS (or FAILED)
+```
+
+Attaching a file id that is still `PARSING` makes the completion fail with
+`biz_code: 9 "invalid ref file id"`, so polling until `SUCCESS` is mandatory.
+
+**Step 3 — completion with the file attached**
+
+```
+POST /api/v0/chat/completion
+Body:
+{
+  "chat_session_id": "uuid",
+  "parent_message_id": null,
+  "model_type": "vision",
+  "prompt": "Что на картинке?",
+  "ref_file_ids": ["file-<uuid>"],
+  "thinking_enabled": false,
+  "search_enabled": false,
+  "action": null,
+  "preempt": false
+}
+```
+
+The proxy performs all three steps automatically whenever a request contains an
+`image_url` (OpenAI) / `image` block (Anthropic) and routes the turn through
+`model_type=vision`.
+
+### 2.5 Proof-of-Work (SHA3 Wasm)
 
 Each API call requires solving a PoW challenge using a WASM module:
 

@@ -556,6 +556,7 @@ FreeDeepseekAPI принимает:
 | `deepseek-r1-search` | `Быстрый` / `default` | да | да | R1-compatible + search |
 | `deepseek-expert` | `Эксперт` / `expert` | нет | нет | Expert mode |
 | `deepseek-v4-pro` | `Эксперт` / `expert` | да | нет | Expert + reasoning |
+| `deepseek-vision` | `Распознавание` / `vision` | нет | нет | изображения (upload + `ref_file_ids`) |
 
 Полный маппинг:
 
@@ -569,9 +570,40 @@ curl http://localhost:9655/v1/model-capabilities
 
 - `default` / UI `Быстрый` — работает; поддерживает `thinking_enabled` и `search_enabled`.
 - `expert` / UI `Эксперт` — работает через актуальный web-контракт (`x-client-version=2.0.0`) и поддерживает `thinking_enabled`. В `/v1/models` выдаются `deepseek-expert` без reasoning и `deepseek-v4-pro` как Expert + reasoning.
-- `vision` / UI `Распознавание` — виден в remote config, но сейчас direct Web API возвращает `backend_err_by_model` (`Vision is temporarily unavailable`). Поэтому `deepseek-vision` скрыт из `/v1/models`.
+- `vision` / UI `Распознавание` — работает. Remote config помечает фичу как beta, но реальный Web API принимает изображения: proxy сам загружает картинку и передаёт `ref_file_ids` с `model_type=vision`. См. раздел «Vision / изображения».
 
 Search для Expert по remote config недоступен, поэтому `deepseek-expert-search` остаётся unsupported.
+
+### Vision / изображения
+
+Прокси принимает изображения в любом из поддерживаемых форматов и сам прогоняет внутренний Web-пайплайн DeepSeek:
+
+1. `image_url` (OpenAI Chat Completions / Responses) — `data:image/...;base64,...` или обычный `http(s)` URL;
+2. `image`-блок (Anthropic Messages) — `source.type = base64` или `url`.
+
+Если в запросе есть картинка, proxy автоматически уходит в `model_type=vision` (независимо от того, какой chat-alias указан в `model`). Alias `deepseek-vision` можно указать явно — тогда картинка обязательна, иначе вернётся `400 missing_image`.
+
+Флоу внутри: upload → `/api/v0/file/upload_file` (PoW `target_path=/api/v0/file/upload_file`) → опрос `/api/v0/file/fetch_files` до статуса `SUCCESS` → completion с `ref_file_ids` и `model_type=vision`.
+
+Пример:
+
+```bash
+curl -X POST http://localhost:9655/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Что на картинке?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,<...>"}}
+      ]
+    }],
+    "stream": false
+  }'
+```
+
+Лимиты настраиваются через `DEEPSEEK_MAX_IMAGE_BYTES` (по умолчанию 10 МБ) и `DEEPSEEK_IMAGE_PARSE_TIMEOUT_MS` (по умолчанию 30000 мс).
 
 ---
 

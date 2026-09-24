@@ -1,5 +1,8 @@
 node_modules/
 .env
+# Local proxy bearer key and env file used by the systemd unit — never commit.
+.proxy-key
+.proxy.env
 *.log
 auth.json
 deepseek-auth.json

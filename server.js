@@ -444,12 +444,15 @@ const MODEL_CONFIGS = {
         supported: false,
         unavailable_reason: 'Expert mode is rejected; remote config says search is not available for Expert.',
     },
+    // DeepSeek Web UI name: “Распознавание”. The beta flag in the remote config
+    // is stale: the real Web API still accepts uploaded images. The proxy uploads
+    // each image via /api/v0/file/upload_file and passes ref_file_ids with
+    // model_type=vision (see uploadImagesToDeepSeek).
     'deepseek-vision': {
         model_type: 'vision', thinking_enabled: false, search_enabled: false,
         real_model: 'DeepSeek Web “Распознавание” / image understanding beta',
         capabilities: { reasoning: false, web_search: false, files: true, vision: true },
-        supported: false,
-        unavailable_reason: 'Current Web API returns: Vision is temporarily unavailable (backend_err_by_model).',
+        supported: true,
     },
 };
 
@@ -526,8 +529,12 @@ function resolveModelConfig(model) {
 function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
 
-async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt) {
+async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt, options = {}) {
     const modelCfg = resolveModelConfig(model);
+    const refFileIds = Array.isArray(options.refFileIds) ? options.refFileIds.filter(Boolean) : [];
+    // Any attached image routes the turn through DeepSeek's vision model_type,
+    // regardless of which chat alias the client asked for.
+    const visionMode = refFileIds.length > 0 || modelCfg.model_type === 'vision';
     const session = getOrCreateAgentSession(agentId);
     const hadRemoteSession = Boolean(session.id);
     const account = selectAccountForSession(session);
@@ -597,9 +604,10 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         body: JSON.stringify({
             chat_session_id: session.id,
             parent_message_id: session.parentMessageId,
-            model_type: modelCfg.model_type,
-            prompt: effectivePrompt, ref_file_ids: [],
-            thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
+            model_type: visionMode ? 'vision' : modelCfg.model_type,
+            prompt: effectivePrompt, ref_file_ids: refFileIds,
+            thinking_enabled: visionMode ? false : modelCfg.thinking_enabled,
+            search_enabled: visionMode ? false : modelCfg.search_enabled,
             action: null, preempt: false,
         })
     });
@@ -640,9 +648,10 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
                 body: JSON.stringify({
                     chat_session_id: session.id,
                     parent_message_id: null,
-                    model_type: modelCfg.model_type,
-                    prompt: freshSessionPrompt, ref_file_ids: [],
-                    thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
+                    model_type: visionMode ? 'vision' : modelCfg.model_type,
+                    prompt: freshSessionPrompt, ref_file_ids: refFileIds,
+                    thinking_enabled: visionMode ? false : modelCfg.thinking_enabled,
+                    search_enabled: visionMode ? false : modelCfg.search_enabled,
                     action: null, preempt: false,
                 })
             });
@@ -1252,11 +1261,199 @@ function normalizeMessageContent(content) {
             if (!part || typeof part !== 'object') return '';
             if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') return part.text || '';
             if (part.type === 'tool_result') return `[Tool Result ${part.tool_use_id || ''}]\n${normalizeMessageContent(part.content)}`;
-            if (part.type === 'image_url') return `[Image: ${part.image_url?.url || ''}]`;
+            if (part.type === 'image_url') {
+                const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+                // Never inline a base64 data URL into the prompt text: it is huge and
+                // the actual pixels travel through the vision upload path instead.
+                if (url && /^data:/i.test(url)) return '[Image attached]';
+                return `[Image: ${url || ''}]`;
+            }
+            if (part.type === 'image' || part.type === 'input_image') return '[Image attached]';
             return part.text || part.content || JSON.stringify(part);
         }).filter(Boolean).join('\n');
     }
     return String(content);
+}
+
+// === Image / vision support ===
+// DeepSeek Web exposes an internal file pipeline: upload the bytes with a PoW
+// bound to /api/v0/file/upload_file, poll /api/v0/file/fetch_files until the
+// server finishes parsing, then attach the returned id as ref_file_ids on a
+// completion request with model_type=vision. Confirmed live against the Web API.
+const MAX_UPLOAD_IMAGE_BYTES = Number(process.env.DEEPSEEK_MAX_IMAGE_BYTES || 10 * 1024 * 1024);
+const IMAGE_PARSE_TIMEOUT_MS = Number(process.env.DEEPSEEK_IMAGE_PARSE_TIMEOUT_MS || 30000);
+const IMAGE_PARSE_POLL_MS = 750;
+const IMAGE_UPLOAD_TARGET = '/api/v0/file/upload_file';
+
+function parseDataUrl(url) {
+    const m = /^data:([^;,]+)?(;base64)?,([\s\S]*)$/i.exec(String(url || ''));
+    if (!m) return null;
+    const mediaType = m[1] || 'application/octet-stream';
+    let data;
+    try {
+        data = m[2] ? Buffer.from(m[3], 'base64') : Buffer.from(decodeURIComponent(m[3]));
+    } catch (e) {
+        return null;
+    }
+    return { mediaType, data };
+}
+
+// Collect image parts from any supported request shape BEFORE normalization
+// flattens content arrays. Returns [{sourceType, mediaType, data|url, name}].
+function extractImageAttachments(params, apiMode) {
+    const images = [];
+    const seen = new Set();
+
+    const pushData = (mediaType, data, name) => {
+        if (!data || data.length === 0) return;
+        const key = `b:${mediaType}:${data.length}:${data.subarray(0, 32).toString('hex')}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        images.push({ sourceType: 'base64', mediaType: mediaType || 'image/png', data, name: name || 'image' });
+    };
+    const pushUrl = (url, mediaType, name) => {
+        if (!url || typeof url !== 'string') return;
+        const parsed = parseDataUrl(url);
+        if (parsed) { pushData(parsed.mediaType, parsed.data, name); return; }
+        if (!/^https?:\/\//i.test(url)) return;
+        if (seen.has(url)) return;
+        seen.add(url);
+        images.push({ sourceType: 'url', mediaType: mediaType || 'image/png', url, name: name || 'image' });
+    };
+    const scanContent = (content) => {
+        if (!Array.isArray(content)) return;
+        for (const part of content) {
+            if (!part || typeof part !== 'object') continue;
+            if (part.type === 'image_url' || part.type === 'input_image') {
+                const u = typeof part.image_url === 'string' ? part.image_url : (part.image_url?.url || part.image_url);
+                pushUrl(u, null, 'image');
+            } else if (part.type === 'image') {
+                const src = part.source || {};
+                if (src.type === 'base64' && src.data) {
+                    pushData(src.media_type || 'image/png', Buffer.from(String(src.data), 'base64'), 'image');
+                } else if (src.type === 'url') {
+                    pushUrl(src.url, src.media_type, 'image');
+                }
+            }
+        }
+    };
+
+    if (apiMode === 'responses') {
+        const items = Array.isArray(params.input) ? params.input : [];
+        for (const item of items) {
+            if (item && typeof item === 'object' && Array.isArray(item.content)) scanContent(item.content);
+        }
+    } else {
+        for (const msg of (params.messages || [])) {
+            if (msg && Array.isArray(msg.content)) scanContent(msg.content);
+        }
+    }
+    return images;
+}
+
+// PoW bound to an arbitrary target_path (completion uses its own inline copy).
+async function createPowHeaderFor(targetPath, account, dsHeaders) {
+    const cr = await dsFetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
+        method: 'POST', headers: dsHeaders,
+        body: JSON.stringify({ target_path: targetPath })
+    });
+    const text = await cr.text();
+    if (!cr.ok) {
+        markAccountFailure(account, cr.status, `pow challenge for ${targetPath}`);
+        throw new Error(`DeepSeek PoW challenge failed (HTTP ${cr.status}) for ${targetPath}.`);
+    }
+    let json;
+    try { json = JSON.parse(text); }
+    catch (e) { throw new Error(`DeepSeek returned non-JSON PoW response for ${targetPath}.`); }
+    const challenge = json?.data?.biz_data?.challenge;
+    if (!challenge) throw new Error(`DeepSeek PoW response has no challenge for ${targetPath}. Auth may be expired.`);
+    const answer = await solvePOW(challenge, account.config.wasmUrl);
+    return Buffer.from(JSON.stringify({
+        algorithm: challenge.algorithm, challenge: challenge.challenge, salt: challenge.salt,
+        answer, signature: challenge.signature, target_path: targetPath
+    })).toString('base64');
+}
+
+async function uploadOneImage(image, account, dsHeaders) {
+    let blob;
+    if (image.sourceType === 'url') {
+        const r = await dsFetch(image.url, {}, 30000);
+        if (!r.ok) throw new Error(`Could not download image (HTTP ${r.status}): ${image.url}`);
+        const buf = Buffer.from(await r.arrayBuffer());
+        if (buf.length > MAX_UPLOAD_IMAGE_BYTES) throw new Error(`Image too large (${buf.length} bytes > ${MAX_UPLOAD_IMAGE_BYTES}).`);
+        blob = new Blob([buf], { type: image.mediaType || r.headers.get('content-type') || 'image/png' });
+    } else {
+        if (image.data.length > MAX_UPLOAD_IMAGE_BYTES) throw new Error(`Image too large (${image.data.length} bytes > ${MAX_UPLOAD_IMAGE_BYTES}).`);
+        blob = new Blob([image.data], { type: image.mediaType || 'image/png' });
+    }
+
+    const pow = await createPowHeaderFor(IMAGE_UPLOAD_TARGET, account, dsHeaders);
+    // The base headers force Content-Type: application/json; multipart must set
+    // its own boundary, so clone and drop it.
+    const uploadHeaders = { ...dsHeaders, 'X-DS-PoW-Response': pow };
+    delete uploadHeaders['Content-Type'];
+    const fd = new FormData();
+    // DeepSeek validates the upload by file extension, so never send a bare name.
+    const subtype = String(blob.type || 'image/png').split('/')[1] || 'png';
+    const extMap = { jpeg: 'jpg', 'svg+xml': 'svg' };
+    const ext = extMap[subtype] || subtype.replace(/[^a-z0-9]/gi, '') || 'png';
+    const filename = /\.[a-z0-9]+$/i.test(image.name || '') ? image.name : `image.${ext}`;
+    fd.append('file', blob, filename);
+
+    const up = await dsFetch('https://chat.deepseek.com/api/v0/file/upload_file', {
+        method: 'POST', headers: uploadHeaders, body: fd
+    });
+    const upText = await up.text();
+    if (!up.ok) {
+        markAccountFailure(account, up.status, 'image upload');
+        throw new Error(`DeepSeek image upload failed (HTTP ${up.status}). First chars: ${upText.substring(0, 120)}`);
+    }
+    let uj;
+    try { uj = JSON.parse(upText); }
+    catch (e) { throw new Error('DeepSeek image upload returned non-JSON.'); }
+    const fileId = uj?.data?.biz_data?.id || uj?.data?.biz_data?.file?.id;
+    if (!fileId) throw new Error(`DeepSeek image upload returned no file id: ${upText.substring(0, 200)}`);
+    return fileId;
+}
+
+async function waitForImageReady(fileId, account, dsHeaders) {
+    const started = Date.now();
+    let lastStatus = 'unknown';
+    while (Date.now() - started < IMAGE_PARSE_TIMEOUT_MS) {
+        const r = await dsFetch(`https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=${encodeURIComponent(fileId)}`, { headers: dsHeaders });
+        const text = await r.text();
+        if (r.ok) {
+            let f = null;
+            try {
+                const j = JSON.parse(text);
+                const files = j?.data?.biz_data?.files || [];
+                f = files.find(x => x.id === fileId) || files[0];
+            } catch (e) { /* transient; keep polling */ }
+            if (f) {
+                lastStatus = f.status;
+                if (f.status === 'SUCCESS') return fileId;
+                if (f.status === 'FAILED') {
+                    throw new Error(`DeepSeek could not parse image ${fileId}: ${f.error_code || 'unknown error'}`);
+                }
+            }
+        }
+        await new Promise(res => setTimeout(res, IMAGE_PARSE_POLL_MS));
+    }
+    throw new Error(`Timed out after ${IMAGE_PARSE_TIMEOUT_MS}ms waiting for DeepSeek to parse image ${fileId} (last status: ${lastStatus}).`);
+}
+
+// Returns the DeepSeek file ids, ready to be passed as ref_file_ids.
+async function uploadImagesToDeepSeek(images, account) {
+    if (!images || images.length === 0) return [];
+    const dsHeaders = account.headers;
+    const fileIds = [];
+    for (const image of images) {
+        const id = await uploadOneImage(image, account, dsHeaders);
+        console.log(`[DS-API] Uploaded image -> ${id}; waiting for parse...`);
+        await waitForImageReady(id, account, dsHeaders);
+        fileIds.push(id);
+    }
+    return fileIds;
 }
 
 function normalizeAnthropicTools(tools = []) {
@@ -1910,6 +2107,15 @@ const server = http.createServer(async (req, res) => {
                 res.end(JSON.stringify({ error: { message: `${requestedModel} is not currently supported through this DeepSeek Web API path`, type: 'unsupported_model', model: requestedModel, real_model: cfg.real_model, reason: cfg.unavailable_reason, capabilities: cfg.capabilities, supported_models: SUPPORTED_MODEL_IDS } }));
                 return;
             }
+            // Pull image attachments out of the raw request before content arrays
+            // are flattened. They travel to DeepSeek via the vision upload path and
+            // are attached to the completion as ref_file_ids.
+            const imageAttachments = extractImageAttachments(rawParams, apiMode);
+            if (requestedModel === 'deepseek-vision' && imageAttachments.length === 0) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: 'deepseek-vision requires at least one image (OpenAI image_url or Anthropic image block).', type: 'missing_image', model: requestedModel } }));
+                return;
+            }
             // Use remote IP for session isolation (local gets 'dev-agent', external per-IP)
             const remoteAddr = req.socket.remoteAddress || 'unknown';
             const requestedSession = req.headers['x-agent-session'] || params.session || params.user;
@@ -1968,6 +2174,25 @@ const server = http.createServer(async (req, res) => {
                 console.log(`${agentTag} Session ${promptRollover.failedSessionId} reset before prompt build (${promptRollover.reason}); recovery history preserved.`);
             }
 
+            // Upload any attached images and collect DeepSeek file ids. The account
+            // is pinned to this session so the file and the completion share it.
+            let refFileIds = [];
+            if (imageAttachments.length > 0) {
+                const imageAccount = selectAccountForSession(session);
+                imageAccount.lastUsedAt = Date.now();
+                try {
+                    refFileIds = await uploadImagesToDeepSeek(imageAttachments, imageAccount);
+                    console.log(`${agentTag} Vision: attached ${refFileIds.length} image(s): ${refFileIds.join(', ')}`);
+                } catch (uploadErr) {
+                    console.log(`${agentTag} Image upload failed: ${uploadErr.message}`);
+                    if (!res.headersSent) {
+                        res.writeHead(502, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ error: { message: uploadErr.message, type: 'image_upload_failed', model: requestedModel } }));
+                    }
+                    return;
+                }
+            }
+
             // Keep a recovery prompt available even while the upstream session
             // is healthy. If that remote chat expires mid-request, its opaque
             // state disappears and the replacement must receive local history.
@@ -1986,7 +2211,7 @@ const server = http.createServer(async (req, res) => {
             }
 
             const startTime = Date.now();
-            const initialCall = await askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt);
+            const initialCall = await askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt, { refFileIds });
             const dsResp = initialCall.resp;
             if (initialCall.promptUsed !== fullPrompt) {
                 fullPrompt = initialCall.promptUsed;
@@ -2124,7 +2349,7 @@ const server = http.createServer(async (req, res) => {
                 resetRemoteSession(session);
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
-                const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel);
+                const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel, retryPrompt, { refFileIds });
                 const retryResult = await readDeepSeekResponse(retryResp.body);
                 const retryState = normalizeRetryResponse(retryResult);
                 fullPrompt = retryPrompt;
