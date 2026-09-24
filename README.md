@@ -579,9 +579,10 @@ Search для Expert по remote config недоступен, поэтому `de
 Прокси принимает изображения в любом из поддерживаемых форматов и сам прогоняет внутренний Web-пайплайн DeepSeek:
 
 1. `image_url` (OpenAI Chat Completions / Responses) — `data:image/...;base64,...` или обычный `http(s)` URL;
-2. `image`-блок (Anthropic Messages) — `source.type = base64` или `url`.
+2. `image`-блок (Anthropic Messages) — `source.type = base64` или `url`;
+3. `file`-part (OpenAI-совместимый `file_data`/`data`) — так вложения приходят, например, из drag & drop в opencode TUI.
 
-Если в запросе есть картинка, proxy автоматически уходит в `model_type=vision` (независимо от того, какой chat-alias указан в `model`). Alias `deepseek-vision` можно указать явно — тогда картинка обязательна, иначе вернётся `400 missing_image`.
+Если в запросе есть картинка, proxy автоматически уходит в `model_type=vision` (независимо от того, какой chat-alias указан в `model`). Это значит, что обычный текстовый чат продолжает работать как обычно, а картинка «подключается» только когда она есть. Alias `deepseek-vision` тоже можно использовать как обычную модель: без картинки он отвечает как чат, с картинкой — распознаёт изображение.
 
 Флоу внутри: upload → `/api/v0/file/upload_file` (PoW `target_path=/api/v0/file/upload_file`) → опрос `/api/v0/file/fetch_files` до статуса `SUCCESS` → completion с `ref_file_ids` и `model_type=vision`.
 

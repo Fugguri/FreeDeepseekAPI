@@ -1269,6 +1269,11 @@ function normalizeMessageContent(content) {
                 return `[Image: ${url || ''}]`;
             }
             if (part.type === 'image' || part.type === 'input_image') return '[Image attached]';
+            if (part.type === 'file') {
+                const f = (part.file && typeof part.file === 'object') ? part.file : part;
+                const mediaType = f.mediaType || f.mime_type || f.mimeType || '';
+                return mediaType.startsWith('image/') ? '[Image attached]' : '[File attached]';
+            }
             return part.text || part.content || JSON.stringify(part);
         }).filter(Boolean).join('\n');
     }
@@ -1333,6 +1338,20 @@ function extractImageAttachments(params, apiMode) {
                     pushData(src.media_type || 'image/png', Buffer.from(String(src.data), 'base64'), 'image');
                 } else if (src.type === 'url') {
                     pushUrl(src.url, src.media_type, 'image');
+                }
+            } else if (part.type === 'file') {
+                // Some clients (e.g. opencode TUI drag & drop) send attachments as
+                // OpenAI-style file parts instead of image_url. Accept the image ones.
+                const f = (part.file && typeof part.file === 'object') ? part.file : part;
+                const mediaType = f.mediaType || f.mime_type || f.mimeType || '';
+                const name = f.filename || f.name || 'image';
+                const url = f.file_data || f.data || f.url || (typeof part.file === 'string' ? part.file : '');
+                if (typeof url === 'string' && url) {
+                    if (mediaType.startsWith('image/') || /^data:image\//i.test(url)) {
+                        pushUrl(url, mediaType || null, name);
+                    }
+                } else if (mediaType.startsWith('image/') && typeof f.data === 'string') {
+                    pushData(mediaType, Buffer.from(f.data, 'base64'), name);
                 }
             }
         }
@@ -2111,11 +2130,6 @@ const server = http.createServer(async (req, res) => {
             // are flattened. They travel to DeepSeek via the vision upload path and
             // are attached to the completion as ref_file_ids.
             const imageAttachments = extractImageAttachments(rawParams, apiMode);
-            if (requestedModel === 'deepseek-vision' && imageAttachments.length === 0) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: { message: 'deepseek-vision requires at least one image (OpenAI image_url or Anthropic image block).', type: 'missing_image', model: requestedModel } }));
-                return;
-            }
             // Use remote IP for session isolation (local gets 'dev-agent', external per-IP)
             const remoteAddr = req.socket.remoteAddress || 'unknown';
             const requestedSession = req.headers['x-agent-session'] || params.session || params.user;
